@@ -308,22 +308,46 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     }
     await page.waitForTimeout(5000);
 
-    // Capture cookies
+    // Capture cookies from current page (before redirect)
     const cookies = await context.cookies();
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Try to navigate to dev.meta.ai to grab API key / session
-    await page.goto('https://dev.meta.ai/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    await page.waitForTimeout(5000);
+    // Wait for redirect to dev.meta.ai after successful OTP
+    log(`[${email}] Waiting for redirect to dev.meta.ai...`);
+    let landedOnDevMeta = false;
+    for (let i = 0; i < 20; i++) {
+      const url = page.url();
+      if (url.includes('dev.meta.ai') && !url.includes('oidc') && !url.includes('auth.meta.com')) {
+        landedOnDevMeta = true;
+        break;
+      }
+      // Try clicking any visible "Continue" button (post-OTP confirmation)
+      try {
+        const contBtn = page.getByRole('button', { name: /continue|confirm|verify|next/i }).first();
+        if (await contBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await contBtn.click({ timeout: 5000 }).catch(() => {});
+        }
+      } catch {}
+      await page.waitForTimeout(2000);
+    }
+
+    // If still not on dev.meta.ai, navigate manually
+    if (!landedOnDevMeta) {
+      log(`[${email}] Redirect didn't land on dev.meta.ai, navigating manually...`);
+      await page.goto('https://dev.meta.ai/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(5000);
+    }
+
+    log(`[${email}] Final URL: ${page.url().substring(0, 100)}`);
+
     const devCookies = await context.cookies('https://dev.meta.ai');
     const devCookieStr = devCookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    // Try to grab access token from page
+    // Try to grab access token from localStorage
     const token = await page.evaluate(() => {
       return localStorage.getItem('access_token') ||
              localStorage.getItem('token') ||
-             localStorage.getItem('accessToken') ||
-             (window.__NEXT_DATA__?.props?.pageProps?.session?.accessToken) || '';
+             localStorage.getItem('accessToken') || '';
     }).catch(() => '');
 
     // === Grab API key from dev.meta.ai dashboard ===
@@ -348,14 +372,16 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
       log(`[${email}] Title: ${pageContent.title}`);
       log(`[${email}] Page text: ${pageContent.text.substring(0, 300)}`);
 
-      // Check localStorage for tokens
+      // Check localStorage for API key tokens (skip session/metadata keys)
       const lsData = await page.evaluate(() => {
         const keys = Object.keys(localStorage);
         const result = {};
         for (const k of keys) {
           try {
             const v = localStorage.getItem(k);
-            if (v && v.length > 5 && v.length < 500 && !v.startsWith('{') && !v.startsWith('[')) {
+            if (v && v.length > 10 && v.length < 500 && !v.startsWith('{') && !v.startsWith('[')) {
+              // Skip known metadata keys
+              if (k === 'Session' || k === 'signal_flush_timestamp' || k === 'hb_timestamp' || k === 'banzai:last_storage_flush') continue;
               result[k] = v.substring(0, 100);
             }
           } catch {}
@@ -368,16 +394,16 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
         for (const k of lsKeys) {
           const v = lsData[k] || '';
           log(`[${email}]   ${k} → ${v.substring(0, 80)}`);
-          if (v.length > 15 && !apiKey) apiKey = v;
+          if (v.length > 15 && !apiKey && /^(sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(v)) apiKey = v;
         }
       }
 
-      // Check sessionStorage too
+      // Check sessionStorage too (only accept key-like values)
       const ssData = await page.evaluate(() => {
-        return Object.keys(sessionStorage).map(k => ({k, v: sessionStorage.getItem(k)?.substring(0, 100)}));
+        return Object.keys(sessionStorage).filter(k => k !== 'Session' && k !== 'signal_flush_timestamp').map(k => ({k, v: sessionStorage.getItem(k)?.substring(0, 100)}));
       }).catch(() => []);
       for (const item of ssData) {
-        if (item.v && item.v.length > 15 && !apiKey) {
+        if (item.v && item.v.length > 15 && !apiKey && /^(sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(item.v)) {
           log(`[${email}] sessionStorage: ${item.k} → ${item.v.substring(0, 60)}`);
           apiKey = item.v;
         }
