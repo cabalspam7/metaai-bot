@@ -142,34 +142,50 @@ async function pollOtp(token, email, timeoutMs = 180000) {
         seen.add(m.id);
         let full;
         try { full = await getMessage(token, m.id); } catch { continue; }
-        const combined = `${full.subject || ''} | ${full.text || ''} | ${full.html || ''}`;
-        log(`  [pollOtp] Email from=${full.from} subj=${full.subject?.substring(0, 80)} bodyPreview=${(full.text || full.html || '').substring(0, 200).replace(/\n/g,' ')}`);
+        const rawHtml = full.html || '';
+        const text = full.text || '';
+        // Strip CSS hex colors (#RRGGBB) and hex-like tokens BEFORE scanning for OTP digits.
+        // Meta emails contain `color:#141823` which is NOT the OTP — it's a known false positive.
+        const htmlNoHex = rawHtml.replace(/#[0-9a-fA-F]{3,8}\b/g, ' ');
+        // Also strip HTML entities like &#064; and inline style attrs to avoid numeric noise
+        const htmlCleaned = htmlNoHex.replace(/&#[0-9]+;/g, ' ').replace(/style="[^"]*"/gi, ' ');
+        const combined = `${full.subject || ''} | ${text} | ${htmlCleaned}`;
+        log(`  [pollOtp] Email from=${full.from} subj=${full.subject?.substring(0, 80)} bodyPreview=${(text || rawHtml).substring(0, 200).replace(/\n/g,' ')}`);
 
-        // Try to be smart: find code near keywords like "confirmation code", "your code is", "enter"
-        // Pattern: keyword ... [digits] OR digits ... keyword
         let code = null;
-        // 1) Look for "is your confirmation code: 123456" or "is 123456"
-        const kwPattern = /(?:confirmation code|your code|enter.*code|verify.*code|code is|code:)[:\s]*([0-9]{6})/i;
-        let kwMatch = combined.match(kwPattern);
-        if (kwMatch) { code = kwMatch[1]; log(`    Found via kwPattern: ${code}`); }
-        else {
-          // 2) 6-digit near code keyword (within 20 chars)
-          const nearMatch = combined.match(/([0-9]{6})[^0-9]{0,30}(?:confirm|code|verify|digit)/i) ||
-                            combined.match(/(?:confirm|code|verify|digit)[^0-9]{0,30}([0-9]{6})/i);
+
+        // 1) Meta-specific: the confirmation code is wrapped in a large-font div:
+        //    <div style="font-size: 24px;...">812114</div>
+        // This is the most reliable signal — the actual OTP is styled big.
+        const styledDiv = rawHtml.match(/font-size:\s*2[0-9]px[^>]*>\s*([0-9]{6})\s*</i);
+        if (styledDiv) {
+          code = styledDiv[1];
+          log(`    Found via styledDiv (font-size:2xpx): ${code}`);
+        }
+
+        // 2) Keyword-based: "confirmation code" followed by digits (allow non-digit separator up to 80 chars)
+        if (!code) {
+          const kwPattern = /(?:confirmation code|your code|enter.*code|verify.*code|code is|code:)[^\d]{0,80}([0-9]{6})/i;
+          const kwMatch = combined.match(kwPattern);
+          if (kwMatch) { code = kwMatch[1]; log(`    Found via kwPattern: ${code}`); }
+        }
+
+        // 3) Near pattern on cleaned (no hex) html
+        if (!code) {
+          const nearMatch = combined.match(/([0-9]{6})[^\d]{0,30}(?:confirm|code|verify|digit)/i) ||
+                            combined.match(/(?:confirm|code|verify|digit)[^\d]{0,30}([0-9]{6})/i);
           if (nearMatch) {
-            // group can be 1
             const g = nearMatch[1];
             if (/^[0-9]{6}$/.test(g)) { code = g; log(`    Found via nearPattern: ${code}`); }
           }
         }
 
-        // 3) Last resort: collect ALL 6-digit, prefer those after "code" keyword position
+        // 4) Fallback: collect ALL 6-digit from hex-stripped text, skip known false positives
         if (!code) {
-          const allSix = [...combined.matchAll(/\b(\d{6})\b/g)].map(x => x[1]);
+          const allSix = [...combined.matchAll(/\b([0-9]{6})\b/g)].map(x => x[1]);
           if (allSix.length) {
-            // Filter known non-otp like 141823 if there are alternatives
-            // Prefer candidates that are NOT the constant spam code
-            const filtered = allSix.filter(c => c !== '141823' || allSix.length === 1);
+            // Filter out known non-OTP numbers (CSS hex leftovers like 141823, ffffff, etc.)
+            const filtered = allSix.filter(c => !['141823','ffffff','1c1e21','141823','000000'].includes(c.toLowerCase()));
             code = filtered[filtered.length - 1] || allSix[allSix.length - 1];
             log(`    Fallback allSix=[${allSix.join(',')}] → picking ${code}`);
           }
