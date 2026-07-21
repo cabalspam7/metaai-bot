@@ -1,4 +1,6 @@
 node_modules/
 error-*.png
+dashboard-*.png
+create-key-*.png
 accounts.txt
 .env

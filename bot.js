@@ -160,9 +160,65 @@ async function registerOne(attempt = 0) {
              (window.__NEXT_DATA__?.props?.pageProps?.session?.accessToken) || '';
     }).catch(() => '');
 
-    appendFileSync(OUTPUT_FILE, `${email}|${PASSWORD}|${token || 'no-token'}|${(devCookieStr || cookieStr).substring(0, 500)}\n`);
+    // === Grab API key from dashboard ===
+    let apiKey = '';
+    try {
+      log(`[${email}] Navigating to /api_keys...`);
+      await page.goto('https://dev.meta.ai/api_keys', { waitUntil: 'networkidle', timeout: 60000 });
+      await page.waitForTimeout(3000);
+
+      // Screenshot for debugging
+      await page.screenshot({ path: `dashboard-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
+
+      // Try to find "Create API Key" / "Generate" / "Create" button
+      const createBtn = page.getByRole('button', { name: /create.*key|generate.*key|create.*api/i }).or(
+        page.getByRole('button', { name: /create|generate/i })
+      ).first();
+      if (await createBtn.isVisible().catch(() => false)) {
+        log(`[${email}] Found create button, clicking...`);
+        await createBtn.click({ timeout: 10000 });
+        await page.waitForTimeout(3000);
+        await page.screenshot({ path: `create-key-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
+      }
+
+      // Look for API key in DOM — could be in input, code block, or text
+      apiKey = await page.evaluate(() => {
+        // Check for input with key value
+        const inputs = document.querySelectorAll('input[value*="AI"], input[value*="sk-"], input[value*="key"], input[value*="ea-"], input[readonly]');
+        for (const inp of inputs) {
+          const v = inp.value || inp.getAttribute('value') || '';
+          if (v.length > 10) return v;
+        }
+        // Check for code/pre blocks
+        const codeBlocks = document.querySelectorAll('code, pre, [class*="key"], [class*="token"], [data-key]');
+        for (const cb of codeBlocks) {
+          const t = cb.textContent.trim();
+          if (t.length > 10 && t.length < 200 && /^[A-Za-z0-9_\-]+$/.test(t)) return t;
+        }
+        // Check clipboard-copy buttons
+        const copyBtns = document.querySelectorAll('button[aria-label*="copy"], button[title*="copy"], [class*="copy"]');
+        for (const cb of copyBtns) {
+          const v = cb.getAttribute('data-clipboard-text') || cb.getAttribute('data-copy') || '';
+          if (v.length > 10) return v;
+        }
+        // Fallback: scrape any long alphanumeric string from page text
+        const body = document.body.innerText;
+        const match = body.match(/(?:sk-|EA-|AI|key)[A-Za-z0-9_\-]{20,}/);
+        if (match) return match[0];
+        return '';
+      }).catch(() => '');
+      if (apiKey) {
+        log(`[${email}] ✅ API key: ${apiKey.substring(0, 20)}...`);
+      } else {
+        log(`[${email}] No API key found in DOM, check dashboard screenshot`);
+      }
+    } catch (e) {
+      log(`[${email}] API key grab failed: ${e.message}`);
+    }
+
+    appendFileSync(OUTPUT_FILE, `${email}|${PASSWORD}|${apiKey || 'no-apikey'}|${token || 'no-token'}|${(devCookieStr || cookieStr).substring(0, 500)}\n`);
     log(`[${email}] ✅ Saved to ${OUTPUT_FILE}`);
-    return { email, password: PASSWORD, token, cookies: devCookieStr || cookieStr };
+    return { email, password: PASSWORD, apiKey, token, cookies: devCookieStr || cookieStr };
   } catch (err) {
     log(`Attempt ${attempt} failed: ${err.message}`);
     try {
