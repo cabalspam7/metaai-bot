@@ -405,7 +405,7 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
         for (const k of lsKeys) {
           const v = lsData[k] || '';
           log(`[${email}]   ${k} → ${v.substring(0, 80)}`);
-          if (v.length > 15 && !apiKey && /^(sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(v)) apiKey = v;
+          if (v.length > 15 && !apiKey && /^(LLM\||sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(v)) apiKey = v;
         }
       }
 
@@ -414,7 +414,7 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
         return Object.keys(sessionStorage).filter(k => k !== 'Session' && k !== 'signal_flush_timestamp').map(k => ({k, v: sessionStorage.getItem(k)?.substring(0, 100)}));
       }).catch(() => []);
       for (const item of ssData) {
-        if (item.v && item.v.length > 15 && !apiKey && /^(sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(item.v)) {
+        if (item.v && item.v.length > 15 && !apiKey && /^(LLM\||sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(item.v)) {
           log(`[${email}] sessionStorage: ${item.k} → ${item.v.substring(0, 60)}`);
           apiKey = item.v;
         }
@@ -449,11 +449,12 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
       if (!apiKey) {
         apiKey = await page.evaluate(() => {
           const body = document.body?.innerText || '';
-          // Look for key patterns
+          // Look for key patterns — Meta Model API uses LLM|number|token format
           const patterns = [
+            /LLM\|\d+\|[A-Za-z0-9_\-]{20,}/,
             /sk-[A-Za-z0-9_\-]{20,}/,
             /EA-[A-Za-z0-9_\-]{20,}/,
-            /[A-Za-z0-9_\-/+=.]{30,80}/,
+            /[A-Za-z0-9_\-/+=.|]{30,80}/,
           ];
           for (const p of patterns) {
             const m = body.match(p);
@@ -485,7 +486,7 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
             return (await r.text()).substring(0, 2000);
           }).catch(() => '');
           log(`[${email}] GraphQL: ${gql.substring(0, 300)}`);
-          const mk = gql.match(/sk-[A-Za-z0-9_-]{20,}/) || gql.match(/"key"\s*:\s*"([^"]+)"/);
+          const mk = gql.match(/LLM\|\d+\|[A-Za-z0-9_-]{20,}/) || gql.match(/sk-[A-Za-z0-9_-]{20,}/) || gql.match(/"key"\s*:\s*"([^"]+)"/);
           if (mk) apiKey = mk[1] || mk[0];
         } catch {}
       }
