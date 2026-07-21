@@ -3,7 +3,7 @@
 // Deploy on Railway (US region) to bypass Meta AI region lock
 
 import { chromium } from 'playwright';
-import { appendFileSync, writeFileSync } from 'fs';
+import { appendFileSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { getDomain, createAccount, getToken, getMessages, getMessage } from './mailtm.js';
 
 const TARGET = parseInt(process.env.TARGET || '5');
@@ -13,6 +13,8 @@ const BIRTHDAY = { year: '1990', month: 'July', day: '21' };
 const HEADLESS = process.env.HEADLESS !== '0';
 const MAX_RETRIES = 2;
 const OTP_TIMEOUT_MS = parseInt(process.env.OTP_TIMEOUT || '180000');
+const PROXY_LIST = (process.env.PROXY_LIST || '').split(/[,\n\s]+/).filter(Boolean);
+const PROXY_FILE = process.env.PROXY_FILE || 'proxies.txt';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -25,6 +27,36 @@ function randStr(n) {
   let s = '';
   for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+function loadProxies() {
+  let proxies = [...PROXY_LIST];
+  if (existsSync(PROXY_FILE)) {
+    proxies.push(...readFileSync(PROXY_FILE, 'utf8').split(/\r?\n/).map(x => x.trim()).filter(Boolean));
+  }
+  // Env single proxy support: http://user:pass@host:port or user:pass@host:port
+  if (process.env.PROXY) proxies.unshift(process.env.PROXY);
+  return [...new Set(proxies)];
+}
+
+function parseProxy(p) {
+  if (!p) return null;
+  let raw = p.trim();
+  if (!raw.startsWith('http://') && !raw.startsWith('https://')) raw = `http://${raw}`;
+  const u = new URL(raw);
+  return {
+    server: `${u.protocol}//${u.hostname}:${u.port}`,
+    username: decodeURIComponent(u.username || ''),
+    password: decodeURIComponent(u.password || ''),
+  };
+}
+
+let proxyCursor = Math.floor(Math.random() * 100000);
+function pickProxy() {
+  const proxies = loadProxies();
+  if (!proxies.length) return null;
+  const p = proxies[proxyCursor++ % proxies.length];
+  return parseProxy(p);
 }
 
 // === mail.tm inbox (using BokuLabs wrapper) ===
@@ -64,9 +96,12 @@ async function pollOtp(token, email, timeoutMs = 180000) {
 
 // === Playwright bot ===
 async function registerOne(attempt = 0) {
+  const proxyConfig = pickProxy();
+  if (proxyConfig) log(`Using proxy: ${proxyConfig.server}`);
   const browser = await chromium.launch({
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
+    ...(proxyConfig ? { proxy: proxyConfig } : {}),
   });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
