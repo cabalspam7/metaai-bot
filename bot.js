@@ -331,12 +331,35 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     await enterOtp(page, otp.code);
     await page.waitForTimeout(2000);
 
-    // Submit OTP (Continue/Verify/Confirm)
-    const submitBtn = page.getByRole('button', { name: 'Continue' }).or(page.getByRole('button', { name: 'Verify' })).or(page.getByRole('button', { name: 'Confirm' })).first();
-    if (await submitBtn.isVisible().catch(() => false)) {
-      await submitBtn.click({ timeout: 10000 }).catch(() => {});
+    // Submit OTP (Next/Continue/Verify/Confirm) — use waitForNavigation not fixed sleep
+    const submitBtn = page.getByRole('button', { name: /next|continue|verify|confirm/i }).first();
+    if (await submitBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      log(`[${email}] Clicking Next/Continue button`);
+      const text1 = await submitBtn.textContent().catch(() => 'unknown');
+      log(`[${email}] Button text: "${text1}"`);
+      // Click with navigation wait
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+          submitBtn.click({ timeout: 10000 }).catch(() => {}),
+        ]);
+      } catch {}
+      // Some Meta flows use evaluate click, try that too if URL didn't change
+      await page.waitForTimeout(3000);
+      if (page.url().includes('register/confirm')) {
+        log(`[${email}] Still on confirm after click, trying evaluate click`);
+        await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('[role=\"button\"]'));
+          const nextBtn = btns.find(b => /next|continue|verify|confirm/i.test(b.textContent));
+          if (nextBtn) nextBtn.click();
+        }).catch(() => {});
+        await page.waitForTimeout(5000);
+      }
+    } else {
+      log(`[${email}] No submit button visible, trying Enter key`);
+      await page.keyboard.press('Enter').catch(() => {});
+      await page.waitForTimeout(5000);
     }
-    await page.waitForTimeout(5000);
 
     // === Post-OTP submit & redirect handling ===
     let postOtpUrl = page.url().substring(0, 150);
@@ -705,23 +728,60 @@ async function findEnabledConfirm(page) {
 }
 
 async function enterOtp(page, code) {
-  // Try single input first
-  const single = page.locator('input[name="code"], input[name="otp"], input[autocomplete="one-time-code"]').first();
-  if (await single.isVisible().catch(() => false)) {
-    await single.fill(code, { timeout: 5000 });
-    return;
-  }
-  // Try 6 separate inputs
-  const inputs = page.locator('input[maxlength="1"], input[inputmode="numeric"]');
-  const count = await inputs.count();
-  if (count >= 6) {
+  log(`Entering OTP ${code} — checking page structure...`);
+  // Log inputs
+  try {
+    const inputs = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('input'));
+      return all.map((inp, i) => `${i}: type=${inp.type} name=${inp.name} maxLen=${inp.maxLength} autoComplete=${inp.autocomplete} inputMode=${inp.inputMode} value=${inp.value} class=${inp.className.substring(0, 50)}`);
+    });
+    log(`OTP inputs: ${inputs.join(' | ').substring(0, 600)}`);
+  } catch {}
+
+  // Try 6 separate inputs (most common for Meta)
+  const sixInputs = page.locator('input[maxlength="1"]');
+  let sixCount = 0;
+  try { sixCount = await sixInputs.count(); } catch {}
+  if (sixCount >= 6) {
+    log(`Found ${sixCount} single-char inputs, filling one-by-one`);
     for (let i = 0; i < 6; i++) {
-      await inputs.nth(i).fill(code[i], { timeout: 3000 });
+      await sixInputs.nth(i).click({ timeout: 2000 }).catch(() => {});
+      await sixInputs.nth(i).fill(code[i], { timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(200);
     }
     return;
   }
-  // Fallback: type into focused element
-  await page.keyboard.type(code, { delay: 100 });
+
+  // Try single input
+  const single = page.locator('input[name="code"], input[name="otp"], input[autocomplete="one-time-code"], input[inputmode="numeric"][maxlength="6"], input[type="text"][maxlength="6"]').first();
+  if (await single.isVisible({ timeout: 3000 }).catch(() => false)) {
+    log('Single OTP input found');
+    await single.click({ timeout: 2000 }).catch(() => {});
+    await single.fill(code, { timeout: 5000 }).catch(() => {});
+    return;
+  }
+
+  // Try numeric inputs more broadly
+  const numericInputs = page.locator('input[inputmode="numeric"], input[type="number"], input[name*="code"], input[id*="code"]');
+  const numericCount = await numericInputs.count().catch(() => 0);
+  if (numericCount >= 6) {
+    log(`Found ${numericCount} numeric inputs`);
+    for (let i = 0; i < 6; i++) {
+      await numericInputs.nth(i).fill(code[i], { timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(100);
+    }
+    return;
+  }
+  if (numericCount >= 1) {
+    await numericInputs.first().fill(code, { timeout: 5000 }).catch(() => {});
+    return;
+  }
+
+  // Fallback: keyboard type
+  log('Fallback keyboard.type');
+  await page.keyboard.press('Control+A').catch(() => {});
+  await page.keyboard.press('Delete').catch(() => {});
+  await page.keyboard.type(code, { delay: 80 });
 }
 
 // === Main loop ===
