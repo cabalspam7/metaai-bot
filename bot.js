@@ -329,54 +329,127 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     // === Grab API key from dashboard ===
     let apiKey = '';
     try {
-      log(`[${email}] Navigating to /api_keys...`);
-      await page.goto('https://dev.meta.ai/api_keys', { waitUntil: 'networkidle', timeout: 60000 });
-      await page.waitForTimeout(3000);
+      // Also try alternative paths
+      const keyPaths = ['/api_keys', '/settings/developer', '/settings'];
+      let currentPath = '/api_keys';
+      for (const p of keyPaths) {
+        log(`[${email}] Trying path: ${p}`);
+        await page.goto(`https://dev.meta.ai${p}`, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+        await page.waitForTimeout(2000);
+        const pathCurr = page.url();
+        if (pathCurr.includes('/oidc/') || pathCurr.includes('auth.meta.com')) {
+          log(`[${email}] ${p} needs re-auth, skipping`);
+          continue;
+        }
+        currentPath = p;
+        break;
+      }
+      log(`[${email}] Final URL: ${page.url()}`);
 
-      // Screenshot for debugging
+      await page.waitForTimeout(3000);
       await page.screenshot({ path: `dashboard-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
 
-      // Try to find "Create API Key" / "Generate" / "Create" button
-      const createBtn = page.getByRole('button', { name: /create.*key|generate.*key|create.*api/i }).or(
-        page.getByRole('button', { name: /create|generate/i })
-      ).first();
-      if (await createBtn.isVisible().catch(() => false)) {
-        log(`[${email}] Found create button, clicking...`);
-        await createBtn.click({ timeout: 10000 });
-        await page.waitForTimeout(3000);
-        await page.screenshot({ path: `create-key-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
-      }
+      // Log page text for debugging
+      const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 3000) || '').catch(() => '');
+      log(`[${email}] Page text: ${pageText.substring(0, 500)}`);
 
-      // Look for API key in DOM — could be in input, code block, or text
+      // Strategy 1: Find and click Create/Add/New API Key button
+      const btnSelectors = [
+        { role: 'button', name: /create.*key|generate.*key|new.*key|add.*key|buat.*key/i },
+        { role: 'button', name: /create|generate|new key|add key|buat|generate/i },
+        { role: 'link', name: /create.*key|generate.*key|new.*key/i },
+      ];
+      for (const sel of btnSelectors) {
+        try {
+          const btn = page.getByRole(sel.role, { name: sel.name }).first();
+          if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+            log(`[${email}] Found [${sel.role}] "${sel.name}", clicking...`);
+            await btn.click({ timeout: 10000 }).catch(() => {});
+            await page.waitForTimeout(3000);
+            break;
+          }
+        } catch {}
+      }
+      // Also try any element with "key" in text and create role
+      try {
+        const anyCreate = page.locator('[class*="key"], [data-testid*="key"], a:has-text("Key"), button:has-text("Key")').first();
+        if (await anyCreate.isVisible({ timeout: 2000 }).catch(() => false)) {
+          log(`[${email}] Found element with "Key" text, clicking...`);
+          await anyCreate.click({ timeout: 5000 }).catch(() => {});
+          await page.waitForTimeout(3000);
+        }
+      } catch {}
+
+      // Wait for any modal/dialog to appear after click
+      await page.waitForTimeout(2000);
+
+      // Strategy 2: Extract API key from DOM with broader patterns
       apiKey = await page.evaluate(() => {
-        // Check for input with key value
-        const inputs = document.querySelectorAll('input[value*="AI"], input[value*="sk-"], input[value*="key"], input[value*="ea-"], input[readonly]');
-        for (const inp of inputs) {
-          const v = inp.value || inp.getAttribute('value') || '';
+        // Check all inputs for long values
+        const allInputs = document.querySelectorAll('input');
+        for (const inp of allInputs) {
+          const v = (inp.value || inp.getAttribute('value') || '').trim();
+          if (v.length > 15 && v.length < 300) return v;
+        }
+        // Check for code/pre blocks with key-like content
+        const codes = document.querySelectorAll('code, pre, [class*="key"], [class*="token"], [class*="apikey"], [data-key], [data-api-key]');
+        for (const c of codes) {
+          const t = c.textContent.trim();
+          if (t.length > 10 && t.length < 300) {
+            // Accept any long alphanumeric string or common key prefixes
+            if (/^[A-Za-z0-9_\-:/+=.]+$/.test(t)) return t;
+          }
+        }
+        // Check clipboard elements
+        const clips = document.querySelectorAll('[data-clipboard-text], [data-copy], [aria-label*="copy"], [title*="copy"], [class*="copy"]');
+        for (const c of clips) {
+          const v = c.getAttribute('data-clipboard-text') || c.getAttribute('data-copy') || c.textContent.trim();
           if (v.length > 10) return v;
         }
-        // Check for code/pre blocks
-        const codeBlocks = document.querySelectorAll('code, pre, [class*="key"], [class*="token"], [data-key]');
-        for (const cb of codeBlocks) {
-          const t = cb.textContent.trim();
-          if (t.length > 10 && t.length < 200 && /^[A-Za-z0-9_\-]+$/.test(t)) return t;
-        }
-        // Check clipboard-copy buttons
-        const copyBtns = document.querySelectorAll('button[aria-label*="copy"], button[title*="copy"], [class*="copy"]');
-        for (const cb of copyBtns) {
-          const v = cb.getAttribute('data-clipboard-text') || cb.getAttribute('data-copy') || '';
+        // Check textarea
+        const ta = document.querySelectorAll('textarea');
+        for (const t of ta) {
+          const v = t.value.trim();
           if (v.length > 10) return v;
         }
-        // Fallback: scrape any long alphanumeric string from page text
+        // Check spans/divs with key-like content
+        const allEls = document.querySelectorAll('span, div, p, li');
+        for (const el of allEls) {
+          const t = el.textContent.trim();
+          if (t.length > 20 && t.length < 300 && /^[A-Za-z0-9_\-:/+=.]{20,}$/.test(t)) return t;
+        }
+        // Broad page text regex
         const body = document.body.innerText;
-        const match = body.match(/(?:sk-|EA-|AI|key)[A-Za-z0-9_\-]{20,}/);
-        if (match) return match[0];
+        const match = body.match(/\b(sk-[A-Za-z0-9_\-]{20,}|ea-[A-Za-z0-9_\-]{20,}|AI[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-/+=.]{30,100})\b/);
+        if (match) return match[1];
         return '';
       }).catch(() => '');
       if (apiKey) {
-        log(`[${email}] ✅ API key: ${apiKey.substring(0, 20)}...`);
+        log(`[${email}] ✅ API key: ${apiKey.substring(0, 32)}...`);
       } else {
-        log(`[${email}] No API key found in DOM, check dashboard screenshot`);
+        log(`[${email}] No API key found in DOM`);
+        // Strategy 3: Try GraphQL query directly using cookies
+        try {
+          const cookies = await context.cookies('https://dev.meta.ai');
+          const cookieStr2 = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+          log(`[${email}] Trying GraphQL direct query for API keys...`);
+          const graphqlRes = await page.evaluate(async (cs) => {
+            const res = await fetch('/api/graphql/', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Cookie: cs },
+              body: JSON.stringify({
+                query: `query { viewer { user { id name } developerApiKeys { edges { node { id key name createdAt } } } } }`
+              })
+            });
+            const data = await res.text();
+            return data.substring(0, 2000);
+          }, cookieStr2).catch(() => 'graphql failed');
+          log(`[${email}] GraphQL response: ${graphqlRes.substring(0, 500)}`);
+          const gk = graphqlRes.match(/"key"\s*:\s*"([^"]+)"/);
+          if (gk) apiKey = gk[1];
+        } catch (gqlErr) {
+          log(`[${email}] GraphQL query failed: ${gqlErr.message}`);
+        }
       }
     } catch (e) {
       log(`[${email}] API key grab failed: ${e.message}`);
