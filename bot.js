@@ -4,7 +4,7 @@
 
 import { chromium } from 'playwright';
 import { appendFileSync, writeFileSync, readFileSync, existsSync } from 'fs';
-import { getDomain, createAccount, getToken, getMessages, getMessage } from './mailtm.js';
+import { getDomain, createAccount, getToken, getMessages, getMessage } from './bokumail.js';
 
 const TARGET = parseInt(process.env.TARGET || '5');
 const OUTPUT_FILE = process.env.OUTPUT_FILE || 'accounts.txt';
@@ -171,7 +171,7 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
   try {
     const inbox = await createInbox();
     const email = inbox.email;
-    log(`[${email}] Inbox created (mail.tm)`);
+    log(`[${email}] Inbox created (TempBokuMail)`);
 
     // Navigate to dev.meta.ai → redirects to auth.meta.com.
     // Meta sometimes aborts during OIDC redirect; retry and accept if auth page is visible.
@@ -292,7 +292,7 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
       await page.waitForTimeout(5000);
     }
 
-    // Poll for OTP from mail.tm
+    // Poll for OTP from TempBokuMail
     const otp = await pollOtp(inbox.token, email, OTP_TIMEOUT_MS);
     if (!otp) throw new Error('OTP not received within timeout');
     log(`[${email}] OTP received: ${otp.code}`);
