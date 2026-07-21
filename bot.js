@@ -38,6 +38,14 @@ function loadBadProxies() {
 }
 
 function blacklistProxy(proxyStr) {
+  // Don't blacklist rotating proxy endpoints (DataImpulse, BrightData, etc.)
+  // These are gateway endpoints that give different IPs per request
+  if (proxyStr && (proxyStr.includes('dataimpulse') || proxyStr.includes('brightdata') ||
+      proxyStr.includes('smartproxy') || proxyStr.includes('iproyal') ||
+      proxyStr.includes('oxylabs') || proxyStr.includes('soax'))) {
+    log(`🔄 Rotating proxy (not blacklisted): ${proxyStr}`);
+    return;
+  }
   if (!proxyStr) return;
   try {
     appendFileSync(BAD_PROXY_FILE, proxyStr + '\n');
@@ -201,10 +209,36 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     }, PASSWORD);
     await page.waitForTimeout(1500);
 
-    // Click enabled Confirm button
-    const confirmBtn = await findEnabledConfirm(page);
-    if (!confirmBtn) throw new Error('Confirm button not enabled (password validation may have failed)');
-    await confirmBtn.click({ timeout: 10000 });
+    // Click enabled Confirm button — wait for it to be enabled, then click
+    // Meta's React combobox + password validation takes a moment to enable the button
+    let confirmClicked = false;
+    for (let i = 0; i < 10; i++) {
+      const enabled = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('[role="button"]'));
+        const confirm = btns.find(b => b.textContent.trim() === 'Confirm' && !b.getAttribute('aria-disabled'));
+        return !!confirm;
+      }).catch(() => false);
+      if (enabled) {
+        // Click via evaluate (most reliable for React custom buttons)
+        await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('[role="button"]'));
+          const confirm = btns.find(b => b.textContent.trim() === 'Confirm' && !b.getAttribute('aria-disabled'));
+          if (confirm) confirm.click();
+        });
+        confirmClicked = true;
+        break;
+      }
+      await page.waitForTimeout(1000);
+    }
+    if (!confirmClicked) {
+      // Fallback: try Playwright locator
+      try {
+        await page.getByRole('button', { name: 'Confirm' }).click({ timeout: 5000 });
+        confirmClicked = true;
+      } catch {
+        throw new Error('Confirm button not enabled after 10s (password validation may have failed)');
+      }
+    }
     log(`[${email}] Confirm clicked, waiting for OTP screen...`);
 
     await page.waitForTimeout(5000);
