@@ -124,7 +124,38 @@ async function registerOne(attempt = 0) {
     await confirmBtn.click({ timeout: 10000 });
     log(`[${email}] Confirm clicked, waiting for OTP screen...`);
 
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(5000);
+
+    // Check what happened after Confirm — OTP screen or error
+    const postConfirm = await page.evaluate(() => {
+      const body = document.body.innerText.substring(0, 1000);
+      const hasOtp = !!document.querySelector('input[autocomplete="one-time-code"], input[name="code"], input[inputmode="numeric"]');
+      const hasError = /something went wrong|isn't available|not available|error|try again/i.test(body);
+      return { hasOtp, hasError, bodyText: body };
+    }).catch(() => ({ hasOtp: false, hasError: false, bodyText: 'eval failed' }));
+
+    log(`[${email}] Post-Confirm: hasOtp=${postConfirm.hasOtp} hasError=${postConfirm.hasError}`);
+    if (postConfirm.bodyText) log(`[${email}] Page text: ${postConfirm.bodyText.substring(0, 200)}`);
+
+    // Screenshot + upload regardless of outcome
+    const postSs = `/tmp/post-confirm-${Date.now()}.png`;
+    await page.screenshot({ path: postSs }).catch(() => {});
+    if (process.env.UPLOAD_UGUU === '1') {
+      try {
+        const { execSync } = await import('child_process');
+        const ssUrl = execSync(`curl -s -F "files[]=@${postSs}" https://uguu.se/upload`, { encoding: 'utf-8' });
+        log(`[${email}] Post-Confirm screenshot: ${ssUrl.trim()}`);
+      } catch (e) { log(`[${email}] Screenshot upload failed: ${e.message}`); }
+    }
+
+    if (postConfirm.hasError) {
+      throw new Error(`Meta error after Confirm: ${postConfirm.bodyText.substring(0, 200)}`);
+    }
+
+    if (!postConfirm.hasOtp) {
+      // Maybe OTP screen takes longer to load — wait more
+      await page.waitForTimeout(5000);
+    }
 
     // Poll for OTP from mail.tm
     const otp = await pollOtp(inbox.token, email, OTP_TIMEOUT_MS);
