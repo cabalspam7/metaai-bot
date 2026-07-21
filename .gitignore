@@ -3,4 +3,5 @@ error-*.png
 dashboard-*.png
 create-key-*.png
 accounts.txt
+bad_proxies.txt
 .env

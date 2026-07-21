@@ -29,6 +29,23 @@ function randStr(n) {
   return s;
 }
 
+const BAD_PROXY_FILE = process.env.BAD_PROXY_FILE || 'bad_proxies.txt';
+const MAX_PROXY_ATTEMPTS = parseInt(process.env.MAX_PROXY_ATTEMPTS || '50');
+
+function loadBadProxies() {
+  if (!existsSync(BAD_PROXY_FILE)) return new Set();
+  return new Set(readFileSync(BAD_PROXY_FILE, 'utf8').split(/\r?\n/).map(x => x.trim()).filter(Boolean));
+}
+
+function blacklistProxy(proxyStr) {
+  if (!proxyStr) return;
+  try {
+    appendFileSync(BAD_PROXY_FILE, proxyStr + '\n');
+    badProxies.add(proxyStr);
+    log(`⛔ Blacklisted proxy: ${proxyStr} (total bad: ${badProxies.size})`);
+  } catch (e) { log(`Failed to blacklist proxy: ${e.message}`); }
+}
+
 function loadProxies() {
   let proxies = [...PROXY_LIST];
   if (existsSync(PROXY_FILE)) {
@@ -51,12 +68,38 @@ function parseProxy(p) {
   };
 }
 
+const badProxies = loadBadProxies();
 let proxyCursor = Math.floor(Math.random() * 100000);
+
 function pickProxy() {
   const proxies = loadProxies();
   if (!proxies.length) return null;
+  // Try proxies in order, skipping bad ones
+  for (let i = 0; i < proxies.length; i++) {
+    const p = proxies[proxyCursor++ % proxies.length];
+    if (!badProxies.has(p)) {
+      return { proxyStr: p, config: parseProxy(p) };
+    }
+  }
+  // All proxies blacklisted — reset and try anyway
+  log('⚠️ All proxies blacklisted, resetting bad list');
+  badProxies.clear();
+  if (existsSync(BAD_PROXY_FILE)) {
+    try { writeFileSync(BAD_PROXY_FILE, ''); } catch {}
+  }
   const p = proxies[proxyCursor++ % proxies.length];
-  return parseProxy(p);
+  return { proxyStr: p, config: parseProxy(p) };
+}
+
+// Check if page shows Meta region restriction modal
+async function checkRegionModal(page) {
+  try {
+    const text = await page.evaluate(() => document.body.innerText.substring(0, 1000));
+    if (/isn't available in your region|isn't available in your country|Model API/i.test(text)) {
+      return { isRegionBlocked: true, text };
+    }
+    return { isRegionBlocked: false, text };
+  } catch { return { isRegionBlocked: false, text: '' }; }
 }
 
 // === mail.tm inbox (using BokuLabs wrapper) ===
@@ -95,9 +138,12 @@ async function pollOtp(token, email, timeoutMs = 180000) {
 }
 
 // === Playwright bot ===
-async function registerOne(attempt = 0) {
-  const proxyConfig = pickProxy();
-  if (proxyConfig) log(`Using proxy: ${proxyConfig.server}`);
+async function registerOne(attempt = 0, proxyAttempt = 0) {
+  const proxyInfo = pickProxy();
+  const proxyConfig = proxyInfo?.config || null;
+  const proxyStr = proxyInfo?.proxyStr || '';
+  if (proxyConfig) log(`[attempt ${proxyAttempt}] Using proxy: ${proxyConfig.server}`);
+  else log(`[attempt ${proxyAttempt}] No proxy available, using direct connection`);
   const browser = await chromium.launch({
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
@@ -185,7 +231,25 @@ async function registerOne(attempt = 0) {
       } catch (e) { log(`[${email}] Screenshot upload failed: ${e.message}`); }
     }
 
-    if (postConfirm.hasError) {
+    // Check for region restriction modal
+    const regionCheck = await checkRegionModal(page);
+    if (regionCheck.isRegionBlocked) {
+      log(`[${email}] ⛔ Region blocked by Meta: ${regionCheck.text.substring(0, 100)}`);
+      if (proxyStr) {
+        blacklistProxy(proxyStr);
+        // Click OK to dismiss modal if possible
+        await page.getByRole('button', { name: 'OK' }).click({ timeout: 3000 }).catch(() => {});
+      }
+      // Rotate to next proxy
+      if (proxyAttempt < MAX_PROXY_ATTEMPTS) {
+        log(`[${email}] Rotating to next proxy (attempt ${proxyAttempt + 1}/${MAX_PROXY_ATTEMPTS})...`);
+        await browser.close().catch(() => {});
+        return registerOne(0, proxyAttempt + 1);
+      }
+      throw new Error('Max proxy attempts reached, all blocked by region restriction');
+    }
+
+    if (postConfirm.hasError && !regionCheck.isRegionBlocked) {
       throw new Error(`Meta error after Confirm: ${postConfirm.bodyText.substring(0, 200)}`);
     }
 
@@ -302,7 +366,7 @@ async function registerOne(attempt = 0) {
 
     return { email, password: PASSWORD, apiKey, token, cookies: devCookieStr || cookieStr };
   } catch (err) {
-    log(`Attempt ${attempt} failed: ${err.message}`);
+    log(`Attempt ${attempt} failed (proxyAttempt=${proxyAttempt}): ${err.message}`);
     try {
       const ss = `/tmp/error-${Date.now()}.png`;
       await page.screenshot({ path: ss });
@@ -315,10 +379,18 @@ async function registerOne(attempt = 0) {
         } catch (uerr) { log(`Error screenshot upload failed: ${uerr.message}`); }
       }
     } catch {}
+    // If region error already handled above, this is a different failure
+    // Retry with same proxy if attempt < MAX_RETRIES
     if (attempt < MAX_RETRIES) {
       log(`Retrying... (${attempt + 1}/${MAX_RETRIES})`);
       await browser.close().catch(() => {});
-      return registerOne(attempt + 1);
+      return registerOne(attempt + 1, proxyAttempt);
+    }
+    // Exhausted retries on this proxy — try next proxy
+    if (proxyAttempt < MAX_PROXY_ATTEMPTS) {
+      log(`Switching proxy (attempt ${proxyAttempt + 1}/${MAX_PROXY_ATTEMPTS})...`);
+      await browser.close().catch(() => {});
+      return registerOne(0, proxyAttempt + 1);
     }
     return null;
   } finally {
