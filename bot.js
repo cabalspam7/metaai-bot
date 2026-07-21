@@ -126,19 +126,59 @@ async function pollOtp(token, email, timeoutMs = 180000) {
   while (Date.now() - start < timeoutMs) {
     try {
       const msgs = await getMessages(token);
-      for (const m of msgs) {
+      // Sort by date newest first (if available) — but in-date might not be ordered
+      // Only look at emails FROM Meta (notification@email.meta.com or similar)
+      const metaMsgs = msgs.filter(m =>
+        /@meta\.com|@facebookmail\.com|@facebook\.com/i.test(m.from || '') ||
+        /meta|facebook/i.test(m.from || '') ||
+        /confirmation code|verify your account|confirm your account|enter.*code/i.test(m.subject || '')
+      );
+      const targets = metaMsgs.length > 0 ? metaMsgs : msgs; // fallback to all if no meta email found
+      for (const m of targets) {
         if (seen.has(m.id)) continue;
         seen.add(m.id);
-        const full = await getMessage(token, m.id);
-        const body = (full.text || full.html || full.intro || '') + ' ' + (full.subject || '');
-        // Meta OTP: 6-digit code in subject or body
-        const codeMatch = body.match(/\b(\d{6})\b/);
-        if (codeMatch) {
-          return { code: codeMatch[1], messageId: m.id };
+        let full;
+        try { full = await getMessage(token, m.id); } catch { continue; }
+        const combined = `${full.subject || ''} | ${full.text || ''} | ${full.html || ''}`;
+        log(`  [pollOtp] Email from=${full.from} subj=${full.subject?.substring(0, 80)} bodyPreview=${(full.text || full.html || '').substring(0, 200).replace(/\n/g,' ')}`);
+
+        // Try to be smart: find code near keywords like "confirmation code", "your code is", "enter"
+        // Pattern: keyword ... [digits] OR digits ... keyword
+        let code = null;
+        // 1) Look for "is your confirmation code: 123456" or "is 123456"
+        const kwPattern = /(?:confirmation code|your code|enter.*code|verify.*code|code is|code:)[:\s]*([0-9]{6})/i;
+        let kwMatch = combined.match(kwPattern);
+        if (kwMatch) { code = kwMatch[1]; log(`    Found via kwPattern: ${code}`); }
+        else {
+          // 2) 6-digit near code keyword (within 20 chars)
+          const nearMatch = combined.match(/([0-9]{6})[^0-9]{0,30}(?:confirm|code|verify|digit)/i) ||
+                            combined.match(/(?:confirm|code|verify|digit)[^0-9]{0,30}([0-9]{6})/i);
+          if (nearMatch) {
+            // group can be 1
+            const g = nearMatch[1];
+            if (/^[0-9]{6}$/.test(g)) { code = g; log(`    Found via nearPattern: ${code}`); }
+          }
+        }
+
+        // 3) Last resort: collect ALL 6-digit, prefer those after "code" keyword position
+        if (!code) {
+          const allSix = [...combined.matchAll(/\b(\d{6})\b/g)].map(x => x[1]);
+          if (allSix.length) {
+            // Filter known non-otp like 141823 if there are alternatives
+            // Prefer candidates that are NOT the constant spam code
+            const filtered = allSix.filter(c => c !== '141823' || allSix.length === 1);
+            code = filtered[filtered.length - 1] || allSix[allSix.length - 1];
+            log(`    Fallback allSix=[${allSix.join(',')}] → picking ${code}`);
+          }
+        }
+
+        if (code && /^\d{6}$/.test(code)) {
+          log(`    ✅ OTP = ${code} (from ${full.from})`);
+          return { code, messageId: m.id };
         }
       }
     } catch (e) {
-      // ignore transient errors
+      log(`pollOtp error: ${e.message}`);
     }
     await sleep(5000);
   }
