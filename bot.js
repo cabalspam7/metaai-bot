@@ -3,7 +3,7 @@
 // Deploy on Railway (US region) to bypass Meta AI region lock
 
 import { chromium } from 'playwright';
-import { appendFileSync } from 'fs';
+import { appendFileSync, writeFileSync } from 'fs';
 import { getDomain, createAccount, getToken, getMessages, getMessage } from './mailtm.js';
 
 const TARGET = parseInt(process.env.TARGET || '5');
@@ -218,6 +218,20 @@ async function registerOne(attempt = 0) {
 
     appendFileSync(OUTPUT_FILE, `${email}|${PASSWORD}|${apiKey || 'no-apikey'}|${token || 'no-token'}|${(devCookieStr || cookieStr).substring(0, 500)}\n`);
     log(`[${email}] ✅ Saved to ${OUTPUT_FILE}`);
+
+    // Upload per-account to uguu.se for remote access
+    if (process.env.UPLOAD_UGUU === '1') {
+      try {
+        const { execSync } = await import('child_process');
+        const upTmp = `/tmp/acct-${Date.now()}.txt`;
+        writeFileSync(upTmp, `${email}|${PASSWORD}|${apiKey || 'no-apikey'}|${token || 'no-token'}\n`);
+        const uguuUrl = execSync(`curl -s -F "files[]=@${upTmp}" https://uguu.se/upload`, { encoding: 'utf-8' });
+        log(`[${email}] Uploaded to uguu: ${uguuUrl.trim()}`);
+      } catch (e) {
+        log(`[${email}] Upload failed: ${e.message}`);
+      }
+    }
+
     return { email, password: PASSWORD, apiKey, token, cookies: devCookieStr || cookieStr };
   } catch (err) {
     log(`Attempt ${attempt} failed: ${err.message}`);
