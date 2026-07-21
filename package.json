@@ -1,0 +1,14 @@
+{
+  "name": "metaai-bot",
+  "version": "1.0.0",
+  "description": "Bulk Meta AI dev account registration bot",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "axios": "^1.6.8"
+  }
+}
