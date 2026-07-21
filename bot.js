@@ -84,12 +84,14 @@ async function registerOne(attempt = 0) {
     const email = inbox.email;
     log(`[${email}] Inbox created (mail.tm)`);
 
-    // Navigate to dev.meta.ai → redirects to auth.meta.com
-    await page.goto('https://dev.meta.ai/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Navigate to dev.meta.ai → redirects to auth.meta.com.
+    // Meta sometimes aborts during OIDC redirect; retry and accept if auth page is visible.
+    await safeGotoAuth(page, email);
     await page.waitForTimeout(3000);
 
     // Click "Use mobile number or email"
-    await page.getByRole('button', { name: 'Use mobile number or email' }).click({ timeout: 15000 });
+    await page.getByRole('button', { name: 'Use mobile number or email' }).click({ timeout: 20000 });
+    await page.waitForTimeout(1000);
     await page.waitForTimeout(1500);
 
     // Type email
@@ -267,9 +269,16 @@ async function registerOne(attempt = 0) {
   } catch (err) {
     log(`Attempt ${attempt} failed: ${err.message}`);
     try {
-      const ss = `error-${Date.now()}.png`;
+      const ss = `/tmp/error-${Date.now()}.png`;
       await page.screenshot({ path: ss });
       log(`Screenshot saved: ${ss}`);
+      if (process.env.UPLOAD_UGUU === '1') {
+        try {
+          const { execSync } = await import('child_process');
+          const ssUrl = execSync(`curl -s -F "files[]=@${ss}" https://uguu.se/upload`, { encoding: 'utf-8' });
+          log(`Error screenshot upload: ${ssUrl.trim()}`);
+        } catch (uerr) { log(`Error screenshot upload failed: ${uerr.message}`); }
+      }
     } catch {}
     if (attempt < MAX_RETRIES) {
       log(`Retrying... (${attempt + 1}/${MAX_RETRIES})`);
@@ -280,6 +289,24 @@ async function registerOne(attempt = 0) {
   } finally {
     await browser.close().catch(() => {});
   }
+}
+
+async function safeGotoAuth(page, email) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      await page.goto('https://dev.meta.ai/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(2500);
+    } catch (e) {
+      log(`[${email}] goto dev.meta.ai attempt ${i + 1} failed/aborted: ${e.message}`);
+      await page.waitForTimeout(2500);
+    }
+    const ok = await page.getByRole('button', { name: 'Use mobile number or email' }).isVisible({ timeout: 5000 }).catch(() => false);
+    if (ok) return;
+    // If redirect left us at blank page, reload from dev.meta.ai again.
+    const loc = await page.evaluate(() => location.href).catch(() => 'unknown');
+    log(`[${email}] auth page not visible after goto attempt ${i + 1}, url=${loc}`);
+  }
+  throw new Error('Auth landing page not visible after retries');
 }
 
 async function setReactCombobox(page, label, value) {
