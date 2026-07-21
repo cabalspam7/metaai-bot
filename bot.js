@@ -326,152 +326,130 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
              (window.__NEXT_DATA__?.props?.pageProps?.session?.accessToken) || '';
     }).catch(() => '');
 
-    // === Grab API key from Meta for Developers (not from dev.meta.ai) ===
+    // === Grab API key from dev.meta.ai dashboard ===
     let apiKey = '';
     try {
-      // Navigate to Meta for Developers and get API key from Model API
-      // Docs say: meta.com -> Meta for Developers -> My Apps -> Model API dashboard
-      const keyUrls = [
-        'https://developers.facebook.com/apps/',
-        'https://meta.com/developers/',
-        'https://developers.meta.com/',
-      ];
-      let onDevPortal = false;
-      for (const url of keyUrls) {
-        log(`[${email}] Navigating to ${url}...`);
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
-        await page.waitForTimeout(3000);
-        const currUrl = page.url();
-        log(`[${email}] Landed at: ${currUrl.substring(0, 100)}`);
-        if (!currUrl.includes('login') && !currUrl.includes('auth.meta.com') && !currUrl.includes('oidc')) {
-          onDevPortal = true;
-          break;
-        }
-      }
+      log(`[${email}] Already on dev.meta.ai, extracting API key...`);
+      await page.waitForTimeout(3000);
 
-      if (!onDevPortal) {
-        // Maybe we need to login via the existing session - try dev.meta.ai first to establish session
-        log(`[${email}] Re-authenticating via dev.meta.ai first...`);
-        await page.goto('https://dev.meta.ai/', { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
-        await page.waitForTimeout(3000);
-        // Now try again
-        for (const url of keyUrls) {
-          await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
-          await page.waitForTimeout(3000);
-          const currUrl = page.url();
-          log(`[${email}] Retry landed at: ${currUrl.substring(0, 100)}`);
-          if (!currUrl.includes('login') && !currUrl.includes('auth.meta.com') && !currUrl.includes('oidc')) {
-            onDevPortal = true;
-            break;
-          }
-        }
-      }
+      // Screenshot for debug
+      await page.screenshot({ path: `dashboard-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
 
-      if (onDevPortal) {
-        log(`[${email}] ✅ On developer portal, looking for API key...`);
-        await page.screenshot({ path: `devportal-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
-        await page.waitForTimeout(3000);
+      // Log page content
+      const pageContent = await page.evaluate(() => {
+        return {
+          url: location.href,
+          title: document.title,
+          text: (document.body?.innerText || '').substring(0, 2000),
+          lsKeys: Object.keys(localStorage || {}).join(', '),
+        };
+      }).catch(() => ({ url: '', title: '', text: '', lsKeys: '' }));
+      log(`[${email}] URL: ${pageContent.url.substring(0, 100)}`);
+      log(`[${email}] Title: ${pageContent.title}`);
+      log(`[${email}] Page text: ${pageContent.text.substring(0, 300)}`);
 
-        // Try to find and click "Create App" / "Model API" / "API Keys"
-        const targetTexts = [
-          /model.api|model api|model/i,
-          /create.*app|buat.*aplikasi/i,
-          /api.*key|generate.*key|my.*key/i,
-        ];
-        for (const pattern of targetTexts) {
+      // Check localStorage for tokens
+      const lsData = await page.evaluate(() => {
+        const keys = Object.keys(localStorage);
+        const result = {};
+        for (const k of keys) {
           try {
-            const link = page.getByText(pattern).first();
-            if (await link.isVisible({ timeout: 2000 }).catch(() => false)) {
-              log(`[${email}] Clicking "${pattern}"...`);
-              await link.click({ timeout: 10000 }).catch(() => {});
-              await page.waitForTimeout(3000);
+            const v = localStorage.getItem(k);
+            if (v && v.length > 5 && v.length < 500 && !v.startsWith('{') && !v.startsWith('[')) {
+              result[k] = v.substring(0, 100);
             }
           } catch {}
         }
-
-        await page.waitForTimeout(2000);
-        await page.screenshot({ path: `apikey-page-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
+        return result;
+      }).catch(() => ({}));
+      const lsKeys = Object.keys(lsData);
+      if (lsKeys.length > 0) {
+        log(`[${email}] localStorage keys: ${lsKeys.join(', ')}`);
+        for (const k of lsKeys) {
+          const v = lsData[k] || '';
+          log(`[${email}]   ${k} → ${v.substring(0, 80)}`);
+          if (v.length > 15 && !apiKey) apiKey = v;
+        }
       }
 
-      // Try to extract any API key from the page
-      apiKey = await page.evaluate(() => {
-        // Check all inputs for long values
-        const allInputs = document.querySelectorAll('input');
-        for (const inp of allInputs) {
-          const v = (inp.value || inp.getAttribute('value') || '').trim();
-          if (v.length > 15 && v.length < 300) return v;
+      // Check sessionStorage too
+      const ssData = await page.evaluate(() => {
+        return Object.keys(sessionStorage).map(k => ({k, v: sessionStorage.getItem(k)?.substring(0, 100)}));
+      }).catch(() => []);
+      for (const item of ssData) {
+        if (item.v && item.v.length > 15 && !apiKey) {
+          log(`[${email}] sessionStorage: ${item.k} → ${item.v.substring(0, 60)}`);
+          apiKey = item.v;
         }
-        // Check for code/pre blocks
-        const codes = document.querySelectorAll('code, pre, [class*="key"], [class*="token"], [class*="apikey"], [data-key]');
-        for (const c of codes) {
-          const t = c.textContent.trim();
-          if (t.length > 10 && t.length < 300 && /^[A-Za-z0-9_\-:/+=.]+$/.test(t)) return t;
-        }
-        // Check clipboard elements
-        const clips = document.querySelectorAll('[data-clipboard-text], [data-copy], [aria-label*="copy"], [title*="copy"]');
-        for (const c of clips) {
-          const v = c.getAttribute('data-clipboard-text') || c.getAttribute('data-copy') || c.textContent.trim();
-          if (v.length > 10) return v;
-        }
-        // Check textareas
-        const ta = document.querySelectorAll('textarea');
-        for (const t of ta) {
-          const v = t.value.trim();
-          if (v.length > 10) return v;
-        }
-        // Broad regex scan
-        const body = document.body?.innerText || '';
-        const match = body.match(/\b(sk-[A-Za-z0-9_\-]{20,}|ea-[A-Za-z0-9_\-]{20,}|AI[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-/+=.]{30,100})\b/);
-        if (match) return match[1];
-        return '';
-      }).catch(() => '');
+      }
+
+      // Try to find API key by clicking through the dashboard UI
+      // Look for settings/profile/user menu
+      const clickTargets = [
+        { role: 'button', name: /setting|preference|account|profile/i },
+        { role: 'link', name: /setting|api.*key|developer|model/i },
+        { role: 'button', name: /menu|more|user/i },
+        { selector: '[class*="avatar"]' },
+        { selector: '[class*="menu"]:not([hidden])' },
+      ];
+      for (const target of clickTargets) {
+        try {
+          let el;
+          if (target.role) {
+            el = page.getByRole(target.role, { name: target.name }).first();
+          } else if (target.selector) {
+            el = page.locator(target.selector).first();
+          }
+          if (el && await el.isVisible({ timeout: 1000 }).catch(() => false)) {
+            log(`[${email}] Clicking ${JSON.stringify(target)}`);
+            await el.click({ timeout: 5000 }).catch(() => {});
+            await page.waitForTimeout(2000);
+          }
+        } catch {}
+      }
+
+      // After clicking, check for API key in new content
+      if (!apiKey) {
+        apiKey = await page.evaluate(() => {
+          const body = document.body?.innerText || '';
+          // Look for key patterns
+          const patterns = [
+            /sk-[A-Za-z0-9_\-]{20,}/,
+            /EA-[A-Za-z0-9_\-]{20,}/,
+            /[A-Za-z0-9_\-/+=.]{30,80}/,
+          ];
+          for (const p of patterns) {
+            const m = body.match(p);
+            if (m) return m[0];
+          }
+          // Check all input values
+          for (const inp of document.querySelectorAll('input')) {
+            const v = (inp.value || '').trim();
+            if (v.length > 15 && v.length < 300) return v;
+          }
+          return '';
+        }).catch(() => '');
+      }
+
       if (apiKey) {
         log(`[${email}] ✅ API key: ${apiKey.substring(0, 32)}...`);
-      }
-
-      // If still no key, try GraphQL queries with credentials:'include'
-      if (!apiKey) {
-        log(`[${email}] No API key in DOM — trying GraphQL...`);
-        const possibleQueries = [
-          `query { viewer { user { id name email } developerApiKeys { edges { node { id key name createdAt } } } } }`,
-          `query { me { apiKeys { id key name createdAt } } }`,
-          `query { currentUser { apiKeys { id key name } } }`,
-        ];
-        let graphqlRes = '';
-        for (const q of possibleQueries) {
-          try {
-            const res = await page.evaluate(async (queryStr) => {
-              const r = await fetch('/api/graphql/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify({ query: queryStr })
-              });
-              return (await r.text()).substring(0, 2000);
-            }, q).catch(() => '');
-            if (res && !res.includes('<!DOCTYPE') && !res.includes('login') && !(res.length < 500 && res.includes('error'))) {
-              graphqlRes = res;
-              log(`[${email}] GraphQL success`);
-              break;
-            }
-          } catch {}
-        }
-        log(`[${email}] GraphQL: ${graphqlRes.substring(0, 300)}`);
-        const gk = graphqlRes.match(/"key"\s*:\s*"((?:sk-|ea-|AI)[^"]+)"/i) || graphqlRes.match(/"key"\s*:\s*"([^"]+)"/);
-        if (gk) apiKey = gk[1];
-      }
-
-      // Strategy 4: Try /api/keys endpoint
-      if (!apiKey && page.url().includes('meta.com') || page.url().includes('facebook.com')) {
+      } else {
+        log(`[${email}] No API key found on page`);
+        // Try GraphQL query on dev.meta.ai
         try {
-          log(`[${email}] Trying /api/keys endpoint...`);
-          const apiRes = await page.evaluate(async () => {
-            const r = await fetch('/api/keys', { credentials: 'include' });
-            return (await r.text()).substring(0, 1000);
+          log(`[${email}] Trying dev.meta.ai GraphQL...`);
+          const gql = await page.evaluate(async () => {
+            const r = await fetch('/api/graphql/', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'include',
+              body: JSON.stringify({ query: `query { viewer { user { id name } developerApiKeys { edges { node { id key name } } } } }` })
+            });
+            return (await r.text()).substring(0, 2000);
           }).catch(() => '');
-          log(`[${email}] /api/keys: ${apiRes.substring(0, 200)}`);
-          const ak = apiRes.match(/"key"\s*:\s*"([^"]+)"/) || apiRes.match(/sk-[A-Za-z0-9_-]{20,}/);
-          if (ak) apiKey = ak[1] || ak[0];
+          log(`[${email}] GraphQL: ${gql.substring(0, 300)}`);
+          const mk = gql.match(/sk-[A-Za-z0-9_-]{20,}/) || gql.match(/"key"\s*:\s*"([^"]+)"/);
+          if (mk) apiKey = mk[1] || mk[0];
         } catch {}
       }
     } catch (e) {
