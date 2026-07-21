@@ -113,11 +113,14 @@ async function checkRegionModal(page) {
 // === mail.tm inbox (using BokuLabs wrapper) ===
 async function createInbox() {
   const domain = await getDomain();
-  const email = `meta${randStr(8)}@${domain}`;
+  // Bokumanga API ignores prefix, generates random email itself.
+  // We pass domain only and use what it returns.
+  const placeholder = `meta${randStr(8)}@${domain}`;
   const pass = `Mp${randStr(12)}!`;
-  await createAccount(email, pass);
-  const { id, token } = await getToken(email, pass);
-  return { email, pass, token, accountId: id };
+  const { id, address: actualEmail } = await createAccount(placeholder, pass);
+  const { token } = await getToken(actualEmail, pass);
+  log(`createInbox: placeholder=${placeholder} actual=${actualEmail}`);
+  return { email: actualEmail, pass, token, accountId: id };
 }
 
 async function pollOtp(token, email, timeoutMs = 180000) {

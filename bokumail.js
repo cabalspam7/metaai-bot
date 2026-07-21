@@ -52,8 +52,8 @@ async function getDomain() {
  * @returns {Promise<{id: string, address: string}>}
  */
 async function createAccount(address, password) {
-  // address = user@domain; bokumanga generate prefix sendiri jika tidak diisi
-  // Tapi kita bisa specify domain via ?domain=
+  // Bokumanga /create?domain=X generates random email on the server.
+  // We must use the returned email from API, not the input address.
   let domain = null;
   if (address && address.includes("@")) {
     domain = address.split("@")[1];
@@ -63,7 +63,9 @@ async function createAccount(address, password) {
   if (!res.data.success) {
     throw new Error(`BokuMail create failed: ${JSON.stringify(res.data)}`);
   }
-  return { id: res.data.email, address: res.data.email };
+  // Use API's generated email (server uses random prefix, ignores our prefix)
+  const actualEmail = res.data.email;
+  return { id: actualEmail, address: actualEmail };
 }
 
 /**
