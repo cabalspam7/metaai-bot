@@ -428,27 +428,58 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
         log(`[${email}] ✅ API key: ${apiKey.substring(0, 32)}...`);
       } else {
         log(`[${email}] No API key found in DOM`);
-        // Strategy 3: Try GraphQL query directly using cookies
+        // Strategy 3: Try GraphQL query — use credentials:'include' (browser auto-sends cookies)
         try {
-          const cookies = await context.cookies('https://dev.meta.ai');
-          const cookieStr2 = cookies.map(c => `${c.name}=${c.value}`).join('; ');
           log(`[${email}] Trying GraphQL direct query for API keys...`);
-          const graphqlRes = await page.evaluate(async (cs) => {
-            const res = await fetch('/api/graphql/', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Cookie: cs },
-              body: JSON.stringify({
-                query: `query { viewer { user { id name } developerApiKeys { edges { node { id key name createdAt } } } } }`
-              })
-            });
-            const data = await res.text();
-            return data.substring(0, 2000);
-          }, cookieStr2).catch(() => 'graphql failed');
+          const possibleQueries = [
+            `query { viewer { user { id name email } developerApiKeys { edges { node { id key name createdAt } } } } }`,
+            `query { me { apiKeys { id key name createdAt } } }`,
+            `query { currentUser { apiKeys { id key name } } }`,
+          ];
+          let graphqlRes = '';
+          for (const q of possibleQueries) {
+            const qIdx = possibleQueries.indexOf(q);
+            try {
+              const res = await page.evaluate(async (queryStr) => {
+                const r = await fetch('/api/graphql/', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'include',
+                  body: JSON.stringify({ query: queryStr })
+                });
+                return (await r.text()).substring(0, 2000);
+              }, q).catch(() => '');
+              if (res && !res.includes('<!DOCTYPE') && !res.includes('login') && !(res.length < 500 && res.includes('error'))) {
+                graphqlRes = res;
+                log(`[${email}] GraphQL success for query ${qIdx}`);
+                break;
+              }
+            } catch (e2) {}
+          }
           log(`[${email}] GraphQL response: ${graphqlRes.substring(0, 500)}`);
           const gk = graphqlRes.match(/"key"\s*:\s*"([^"]+)"/);
           if (gk) apiKey = gk[1];
+          // Also try to extract from the GraphQL response any field with "key" pattern
+          if (!apiKey) {
+            const keyPattern = graphqlRes.match(/"key"\s*:\s*"((?:sk-|ea-|AI)[^"]+)"/i);
+            if (keyPattern) apiKey = keyPattern[1];
+          }
         } catch (gqlErr) {
           log(`[${email}] GraphQL query failed: ${gqlErr.message}`);
+        }
+
+        // Strategy 4: If still no key, try making a direct API call for the key
+        if (!apiKey && page.url().includes('dev.meta.ai')) {
+          try {
+            log(`[${email}] Trying strategy 4: fetch developer API keys page...`);
+            const apiRes = await page.evaluate(async () => {
+              const r = await fetch('/api/keys', { credentials: 'include' });
+              return (await r.text()).substring(0, 1000);
+            }).catch(() => '');
+            log(`[${email}] /api/keys response: ${apiRes.substring(0, 300)}`);
+            const ak = apiRes.match(/"key"\s*:\s*"([^"]+)"/) || apiRes.match(/sk-[A-Za-z0-9_-]{20,}/);
+            if (ak) apiKey = ak[1] || ak[0];
+          } catch {}
         }
       }
     } catch (e) {
