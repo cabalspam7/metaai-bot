@@ -308,6 +308,17 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     }
     await page.waitForTimeout(5000);
 
+    // Log page state after OTP submit
+    const postOtpUrl = page.url().substring(0, 120);
+    const postOtpText = await page.evaluate(() => (document.body?.innerText || '').substring(0, 500)).catch(() => '');
+    log(`[${email}] After OTP submit — URL: ${postOtpUrl}`);
+    log(`[${email}] After OTP submit — Page: ${postOtpText.substring(0, 300)}`);
+
+    // If still on confirm page, the OTP might have been rejected. Try resending.
+    if (postOtpUrl.includes('register/confirm') && !postOtpText.includes('dev.meta') && !postOtpText.includes('dashboard')) {
+      log(`[${email}] Still on confirm page after OTP submit — OTP may have been rejected`);
+    }
+
     // Capture cookies from current page (before redirect)
     const cookies = await context.cookies();
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
