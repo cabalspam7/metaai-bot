@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "chromium", "fontconfig", "freetype"]
+
+[phases.install]
+cmds = ["npm ci --production", "npx playwright install chromium"]
+
+[start]
+cmd = "node bot.js"
+
+[variables]
+PLAYWRIGHT_BROWSERS_PATH = "/app/.cache/ms-playwright"
+HEADLESS = "1"
