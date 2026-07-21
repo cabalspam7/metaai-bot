@@ -297,6 +297,36 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     if (!otp) throw new Error('OTP not received within timeout');
     log(`[${email}] OTP received: ${otp.code}`);
 
+    // Setup network capture BEFORE submit — intercept API key creation
+    let capturedApiKey = '';
+    let capturedResponses = [];
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('api.meta.ai') || url.includes('dev.meta.ai') || url.includes('auth.meta.com') || url.includes('facebook.com')) {
+        if (url.includes('/v1/') || url.includes('api_key') || url.includes('api-key') || url.includes('graphql') || url.includes('/api/') || url.includes('register') || url.includes('oidc')) {
+          try {
+            const txt = await response.text();
+            const llmMatch = txt.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+            const keyFieldMatch = txt.match(/"api_key"\s*:\s*"(LLM[^"]+)"/) || txt.match(/"key"\s*:\s*"(LLM\|[^"]+)"/);
+            if (llmMatch || keyFieldMatch) {
+              const foundKey = keyFieldMatch ? keyFieldMatch[1] : llmMatch[0];
+              if (!capturedApiKey) {
+                capturedApiKey = foundKey;
+                log(`[${email}] 📡 Captured API key: ${url.substring(0, 100)} → ${capturedApiKey.substring(0, 40)}...`);
+              }
+            }
+            if (txt.length > 20 && txt.length < 10000) {
+              // Log interesting responses that might contain key/redirect
+              const isInteresting = /api_?key|LLM\|/i.test(txt) || /dev\.meta\.ai/i.test(txt);
+              if (isInteresting) {
+                capturedResponses.push({ url: url.substring(0, 150), status: response.status(), body: txt.substring(0, 1000) });
+              }
+            }
+          } catch {}
+        }
+      }
+    });
+
     // Enter OTP — find 6-digit input or single inputs
     await enterOtp(page, otp.code);
     await page.waitForTimeout(2000);
@@ -308,15 +338,53 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
     }
     await page.waitForTimeout(5000);
 
-    // Log page state after OTP submit
-    const postOtpUrl = page.url().substring(0, 120);
-    const postOtpText = await page.evaluate(() => (document.body?.innerText || '').substring(0, 500)).catch(() => '');
+    // === Post-OTP submit & redirect handling ===
+    let postOtpUrl = page.url().substring(0, 150);
+    let postOtpText = '';
+    try { postOtpText = await page.evaluate(() => (document.body?.innerText || '').substring(0, 600)); } catch {}
     log(`[${email}] After OTP submit — URL: ${postOtpUrl}`);
-    log(`[${email}] After OTP submit — Page: ${postOtpText.substring(0, 300)}`);
+    log(`[${email}] After OTP submit — Page: ${postOtpText.substring(0, 350)}`);
 
-    // If still on confirm page, the OTP might have been rejected. Try resending.
-    if (postOtpUrl.includes('register/confirm') && !postOtpText.includes('dev.meta') && !postOtpText.includes('dashboard')) {
-      log(`[${email}] Still on confirm page after OTP submit — OTP may have been rejected`);
+    // If still on confirm page, try additional button clicks
+    if (postOtpUrl.includes('register/confirm')) {
+      for (let i = 0; i < 4; i++) {
+        await page.waitForTimeout(3000);
+        const loopUrl = page.url();
+        if (!loopUrl.includes('register/confirm')) {
+          log(`[${email}] Left confirm page: ${loopUrl.substring(0, 100)}`);
+          break;
+        }
+        log(`[${email}] Still on confirm, clicking buttons (attempt ${i + 1}), capturedResponses=${capturedResponses.length}`);
+        try {
+          const btns = await page.getByRole('button').all();
+          let clicked = false;
+          for (const b of btns) {
+            const txt = await b.textContent().catch(() => '');
+            if (/continue|confirm|verify|next|ok/i.test(txt)) {
+              const visible = await b.isVisible({ timeout: 1000 }).catch(() => false);
+              if (visible) {
+                log(`[${email}] Clicking button: "${txt}"`);
+                await b.click({ timeout: 5000 }).catch(() => {});
+                await page.waitForTimeout(3000);
+                clicked = true;
+                break;
+              }
+            }
+          }
+          if (!clicked) {
+            log(`[${email}] No usable buttons found, checking network for redirect/code`);
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // Log captured responses
+    if (capturedResponses.length > 0) {
+      log(`[${email}] Captured ${capturedResponses.length} interesting network responses`);
+      for (const r of capturedResponses.slice(-3)) {
+        log(`[${email}]  - ${r.status} ${r.url.substring(0, 80)} → ${r.body.substring(0, 200)}`);
+      }
     }
 
     // Capture cookies from current page (before redirect)
@@ -361,39 +429,49 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
              localStorage.getItem('accessToken') || '';
     }).catch(() => '');
 
-    // === Grab API key from dev.meta.ai dashboard ===
-    let apiKey = '';
-    try {
-      log(`[${email}] Already on dev.meta.ai, extracting API key...`);
-      await page.waitForTimeout(3000);
+    // === API key extraction — priority: network capture > dashboard ===
+    let apiKey = capturedApiKey || '';
+    if (apiKey) {
+      log(`[${email}] ✅ API key from network capture: ${apiKey.substring(0, 40)}...`);
+    }
 
-      // Screenshot for debug
-      await page.screenshot({ path: `dashboard-${email.replace(/[@.]/g, '_')}.png` }).catch(() => {});
+    // If not captured from network, try dashboard extraction
+    if (!apiKey) {
+    try {
+      log(`[${email}] Not captured from network, trying dashboard...`);
+
+      // Navigate to dev.meta.ai (if not already there)
+      const currUrl = page.url();
+      if (!currUrl.includes('dev.meta.ai')) {
+        log(`[${email}] Navigating to dev.meta.ai...`);
+        await page.goto('https://dev.meta.ai/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await page.waitForTimeout(5000);
+        log(`[${email}] After goto dev.meta.ai — URL: ${page.url().substring(0, 100)}`);
+      }
 
       // Log page content
       const pageContent = await page.evaluate(() => {
         return {
           url: location.href,
           title: document.title,
-          text: (document.body?.innerText || '').substring(0, 2000),
+          text: (document.body?.innerText || '').substring(0, 3000),
           lsKeys: Object.keys(localStorage || {}).join(', '),
         };
       }).catch(() => ({ url: '', title: '', text: '', lsKeys: '' }));
       log(`[${email}] URL: ${pageContent.url.substring(0, 100)}`);
       log(`[${email}] Title: ${pageContent.title}`);
-      log(`[${email}] Page text: ${pageContent.text.substring(0, 300)}`);
+      log(`[${email}] Page text: ${pageContent.text.substring(0, 500)}`);
 
-      // Check localStorage for API key tokens (skip session/metadata keys)
+      // Check localStorage for API key tokens
       const lsData = await page.evaluate(() => {
         const keys = Object.keys(localStorage);
         const result = {};
         for (const k of keys) {
           try {
             const v = localStorage.getItem(k);
-            if (v && v.length > 10 && v.length < 500 && !v.startsWith('{') && !v.startsWith('[')) {
-              // Skip known metadata keys
+            if (v && v.length > 15 && v.length < 1000 && !v.startsWith('{') && !v.startsWith('[')) {
               if (k === 'Session' || k === 'signal_flush_timestamp' || k === 'hb_timestamp' || k === 'banzai:last_storage_flush') continue;
-              result[k] = v.substring(0, 100);
+              result[k] = v.substring(0, 200);
             }
           } catch {}
         }
@@ -401,97 +479,143 @@ async function registerOne(attempt = 0, proxyAttempt = 0) {
       }).catch(() => ({}));
       const lsKeys = Object.keys(lsData);
       if (lsKeys.length > 0) {
-        log(`[${email}] localStorage keys: ${lsKeys.join(', ')}`);
+        log(`[${email}] localStorage: ${lsKeys.length} keys`);
         for (const k of lsKeys) {
           const v = lsData[k] || '';
-          log(`[${email}]   ${k} → ${v.substring(0, 80)}`);
-          if (v.length > 15 && !apiKey && /^(LLM\||sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(v)) apiKey = v;
+          if (/LLM\|\d+\|/.test(v)) { apiKey = v.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/)?.[0] || v; break; }
+          log(`[${email}]   LS ${k} → ${v.substring(0, 80)}`);
         }
       }
 
-      // Check sessionStorage too (only accept key-like values)
-      const ssData = await page.evaluate(() => {
-        return Object.keys(sessionStorage).filter(k => k !== 'Session' && k !== 'signal_flush_timestamp').map(k => ({k, v: sessionStorage.getItem(k)?.substring(0, 100)}));
-      }).catch(() => []);
-      for (const item of ssData) {
-        if (item.v && item.v.length > 15 && !apiKey && /^(LLM\||sk-|ea-|AI|[A-Za-z0-9_-]{30,})/.test(item.v)) {
-          log(`[${email}] sessionStorage: ${item.k} → ${item.v.substring(0, 60)}`);
-          apiKey = item.v;
-        }
+      // Scan page text for LLM| pattern
+      if (!apiKey && pageContent.text) {
+        const m = pageContent.text.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+        if (m) { apiKey = m[0]; log(`[${email}] ✅ API key from page text: ${apiKey.substring(0, 40)}...`); }
       }
 
-      // Try to find API key by clicking through the dashboard UI
-      // Look for settings/profile/user menu
-      const clickTargets = [
-        { role: 'button', name: /setting|preference|account|profile/i },
-        { role: 'link', name: /setting|api.*key|developer|model/i },
-        { role: 'button', name: /menu|more|user/i },
-        { selector: '[class*="avatar"]' },
-        { selector: '[class*="menu"]:not([hidden])' },
-      ];
-      for (const target of clickTargets) {
-        try {
-          let el;
-          if (target.role) {
-            el = page.getByRole(target.role, { name: target.name }).first();
-          } else if (target.selector) {
-            el = page.locator(target.selector).first();
-          }
-          if (el && await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-            log(`[${email}] Clicking ${JSON.stringify(target)}`);
-            await el.click({ timeout: 5000 }).catch(() => {});
-            await page.waitForTimeout(2000);
-          }
-        } catch {}
-      }
-
-      // After clicking, check for API key in new content
+      // Try to find API key in all inputs / buttons / code blocks
       if (!apiKey) {
-        apiKey = await page.evaluate(() => {
-          const body = document.body?.innerText || '';
-          // Look for key patterns — Meta Model API uses LLM|number|token format
-          const patterns = [
-            /LLM\|\d+\|[A-Za-z0-9_\-]{20,}/,
-            /sk-[A-Za-z0-9_\-]{20,}/,
-            /EA-[A-Za-z0-9_\-]{20,}/,
-            /[A-Za-z0-9_\-/+=.|]{30,80}/,
-          ];
-          for (const p of patterns) {
-            const m = body.match(p);
-            if (m) return m[0];
-          }
-          // Check all input values
+        const pageKey = await page.evaluate(() => {
+          // Check inputs
           for (const inp of document.querySelectorAll('input')) {
             const v = (inp.value || '').trim();
-            if (v.length > 15 && v.length < 300) return v;
+            if (/LLM\|\d+\|/.test(v)) return v;
           }
+          // Check code/pre elements
+          for (const el of document.querySelectorAll('code, pre, [class*=\"api\"], [class*=\"key\"], [data-testid*=\"key\"], [data-testid*=\"api\"]')) {
+            const t = (el.textContent || '').trim();
+            if (/LLM\|\d+\|/.test(t)) {
+              const mm = t.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+              if (mm) return mm[0];
+            }
+          }
+          // Check entire body for LLM pattern
+          const body = document.body?.innerText || '';
+          const mm = body.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+          if (mm) return mm[0];
           return '';
         }).catch(() => '');
+        if (pageKey) { apiKey = pageKey; log(`[${email}] ✅ API key from DOM scan: ${apiKey.substring(0, 40)}...`); }
       }
 
-      if (apiKey) {
-        log(`[${email}] ✅ API key: ${apiKey.substring(0, 32)}...`);
-      } else {
-        log(`[${email}] No API key found on page`);
-        // Try GraphQL query on dev.meta.ai
+      // Try GraphQL and REST endpoints on dev.meta.ai
+      if (!apiKey) {
         try {
-          log(`[${email}] Trying dev.meta.ai GraphQL...`);
-          const gql = await page.evaluate(async () => {
-            const r = await fetch('/api/graphql/', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              credentials: 'include',
-              body: JSON.stringify({ query: `query { viewer { user { id name } developerApiKeys { edges { node { id key name } } } } }` })
-            });
-            return (await r.text()).substring(0, 2000);
-          }).catch(() => '');
-          log(`[${email}] GraphQL: ${gql.substring(0, 300)}`);
-          const mk = gql.match(/LLM\|\d+\|[A-Za-z0-9_-]{20,}/) || gql.match(/sk-[A-Za-z0-9_-]{20,}/) || gql.match(/"key"\s*:\s*"([^"]+)"/);
-          if (mk) apiKey = mk[1] || mk[0];
-        } catch {}
+          log(`[${email}] Trying GraphQL endpoints...`);
+          const queries = [
+            'query { viewer { user { id name } developerApiKeys { edges { node { id key name } } } } }',
+            'query { viewer { apiKeys { id key } } }',
+            'query { me { apiKey } }',
+          ];
+          for (const q of queries) {
+            const gqlRes = await page.evaluate(async (query) => {
+              try {
+                const r = await fetch('/api/graphql/', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'include',
+                  body: JSON.stringify({ query }),
+                });
+                return { status: r.status, text: (await r.text()).substring(0, 2000), url: r.url };
+              } catch (e) { return { status: 0, text: e.message, url: '' }; }
+            }, q).catch(() => ({ status: 0, text: 'error', url: '' }));
+            if (/LLM\|\d+\|/.test(gqlRes.text)) {
+              const m = gqlRes.text.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+              if (m) { apiKey = m[0]; log(`[${email}] ✅ API key from GraphQL: ${apiKey.substring(0, 40)}...`); break; }
+            }
+          }
+
+          // Also try REST: /api/keys or /api/api_keys
+          if (!apiKey) {
+            const restUrls = ['/api/keys', '/api/api_keys', '/api/v1/keys', '/api/v1/api_keys', '/api/model/keys'];
+            for (const restPath of restUrls) {
+              const restRes = await page.evaluate(async (url) => {
+                try {
+                  const r = await fetch(url, { credentials: 'include' });
+                  return { status: r.status, text: (await r.text()).substring(0, 2000) };
+                } catch (e) { return { status: 0, text: e.message }; }
+              }, restPath).catch(() => ({ status: 0, text: '' }));
+              if (/LLM\|\d+\|/.test(restRes.text)) {
+                const m = restRes.text.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+                if (m) { apiKey = m[0]; log(`[${email}] ✅ API key from REST ${restPath}: ${apiKey.substring(0, 40)}...`); break; }
+              }
+            }
+          }
+        } catch (e) { log(`[${email}] API query failed: ${e.message}`); }
+      }
+
+      // Try API.meta.ai directly with cookies — create API key if needed
+      if (!apiKey) {
+        try {
+          log(`[${email}] Trying api.meta.ai directly...`);
+          const allCookies = await context.cookies();
+          const metaCookies = allCookies.filter(c => c.domain.includes('meta.com') || c.domain.includes('meta.ai'));
+          log(`[${email}] Meta cookies: ${metaCookies.map(c => c.name).join(', ')}`);
+
+          // Try to create an API key via api.meta.ai using session
+          // The API key creation flow might be POST /v1/api_keys or similar
+          const createEndpoints = [
+            { url: 'https://api.meta.ai/v1/api-keys', method: 'POST', body: JSON.stringify({ name: 'my-key' }) },
+            { url: 'https://api.meta.ai/v1/keys', method: 'POST', body: JSON.stringify({ name: 'my-key' }) },
+            { url: 'https://dev.meta.ai/api/keys', method: 'POST', body: JSON.stringify({ name: 'my-key' }) },
+          ];
+          for (const ep of createEndpoints) {
+            const createRes = await page.evaluate(async (endpoint) => {
+              try {
+                const r = await fetch(endpoint.url, {
+                  method: endpoint.method,
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'include',
+                  body: endpoint.body,
+                });
+                return { status: r.status, text: (await r.text()).substring(0, 2000) };
+              } catch (e) { return { status: 0, text: e.message }; }
+            }, ep).catch(() => ({ status: 0, text: '' }));
+            log(`[${email}] Create key ${ep.url}: ${createRes.status} → ${createRes.text.substring(0, 200)}`);
+            if (/LLM\|\d+\|/.test(createRes.text)) {
+              const m = createRes.text.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+              if (m) { apiKey = m[0]; log(`[${email}] ✅ API key created via ${ep.url}: ${apiKey.substring(0, 40)}...`); break; }
+            }
+          }
+        } catch (e) { log(`[${email}] Direct API attempt failed: ${e.message}`); }
       }
     } catch (e) {
-      log(`[${email}] API key grab failed: ${e.message}`);
+      log(`[${email}] API key extraction error: ${e.message}`);
+    }
+    } // end if !apiKey from network
+
+    // Use captured from network as fallback if still no key
+    if (!apiKey && capturedApiKey) {
+      apiKey = capturedApiKey;
+      log(`[${email}] Using captured API key from network: ${apiKey.substring(0, 40)}...`);
+    }
+
+    // If network responses didn't capture but had interesting data
+    if (!apiKey && capturedResponses.length > 0) {
+      for (const r of capturedResponses) {
+        const m = r.body.match(/LLM\|\d+\|[A-Za-z0-9_-]{15,}/);
+        if (m) { apiKey = m[0]; log(`[${email}] ✅ API key from captured response: ${apiKey.substring(0, 40)}...`); break; }
+      }
     }
 
     appendFileSync(OUTPUT_FILE, `${email}|${PASSWORD}|${apiKey || 'no-apikey'}|${token || 'no-token'}|${(devCookieStr || cookieStr).substring(0, 500)}\n`);
